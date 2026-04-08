@@ -52,7 +52,13 @@ router.get('/:id', async (req, res) => {
 });
 // CRÉER UN DÉPARTEMENT
 router.post('/', async (req, res) => {
-    const { organisation_id, parent_id, code, nom, description, responsable_id, budget_annuel, effectif_max } = req.body;
+    let { organisation_id, parent_id, code, nom, description, responsable_id, budget_annuel, effectif_max } = req.body;
+
+    // Convertir les chaînes vides en null pour les UUIDs
+    organisation_id = organisation_id === '' ? null : organisation_id;
+    parent_id = parent_id === '' ? null : parent_id;
+    responsable_id = responsable_id === '' ? null : responsable_id;
+
     try {
         const sql = `
             INSERT INTO departement (organisation_id, parent_id, code, nom, description, responsable_id, budget_annuel, effectif_max)
@@ -70,8 +76,24 @@ router.post('/', async (req, res) => {
 // MODIFIER (PATCH)
 router.patch('/:id', async (req, res) => {
     const { id } = req.params;
-    const fields = req.body;
+    let fields = { ...req.body };
+
+    // Champs autorisés pour la mise à jour
+    const allowedFields = ['organisation_id', 'parent_id', 'code', 'nom', 'description', 'responsable_id', 'budget_annuel', 'effectif_max'];
+
+    // Conserver uniquement les champs autorisés
+    fields = Object.fromEntries(
+        Object.entries(fields).filter(([key]) => allowedFields.includes(key))
+    );
+
+    // Convertir les chaînes vides en null pour les UUIDs
+    if (fields.organisation_id === '') fields.organisation_id = null;
+    if (fields.parent_id === '') fields.parent_id = null;
+    if (fields.responsable_id === '') fields.responsable_id = null;
+
     const keys = Object.keys(fields);
+    if (keys.length === 0) return res.status(400).json({ error: "Aucun champ à modifier ou champs invalides fournis" });
+
     const setClause = keys.map((key, i) => `${key} = $${i + 1}`).join(', ');
     const values = Object.values(fields);
     values.push(id);
@@ -81,6 +103,7 @@ router.patch('/:id', async (req, res) => {
         const result = await db.query(sql, values);
         res.json(result.rows[0]);
     } catch (err) {
+        console.log('Erreur lors de la mise à jour :', err);
         res.status(500).json({ error: err.message });
     }
 });
