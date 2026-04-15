@@ -132,29 +132,39 @@ router.get('/conges_en_attente', async (req, res) => {
   try {
     // Note : On retire les paramètres inutilisés dans le SQL pour éviter l'erreur 
     // "bind message has X parameters, but prepared statement requires 0"
-    
+
     const sql = `
-      SELECT 
-        c.id,
-        e.nom, 
-        e.prenom, 
-        c.date_debut, 
-        c.date_fin, 
-        c.nb_jours, 
-        c.statut,
-        tc.libelle as type_conge, -- Ajout pour plus de clarté
-        c.created_at
-      FROM 
-        conge c
-      JOIN 
-        employe e ON c.employe_id = e.id
-      LEFT JOIN 
-        type_conge tc ON c.type_conge_id = tc.id
-      WHERE 
-        c.statut NOT IN ('approuve', 'refuse', 'annule')
-      ORDER BY 
-        c.created_at DESC;
-    `;
+        SELECT 
+            c.id,
+            e.nom, 
+            e.prenom, 
+            e.matricule, -- Ajouté pour votre template Angular
+            c.date_debut, 
+            c.date_fin, 
+            c.nb_jours, 
+            c.statut,
+            c.motif,
+            tc.libelle as type_conge,
+            tc.code as code_type,
+            c.created_at,
+            sc.solde_restant, -- On récupère le solde depuis la table solde_conge
+            sc.solde_initial -- Solde initial pour affichage dans le détail
+        FROM 
+            conge c
+        JOIN 
+            employe e ON c.employe_id = e.id
+        LEFT JOIN 
+            type_conge tc ON c.type_conge_id = tc.id
+        LEFT JOIN 
+            solde_conge sc ON (
+                sc.employe_id = c.employe_id 
+                AND sc.type_conge_id = c.type_conge_id 
+                AND sc.annee = EXTRACT(YEAR FROM c.date_debut)
+            )
+        WHERE 
+            c.statut NOT IN ('approuve', 'refuse', 'annule')
+        ORDER BY 
+            c.created_at DESC;`;
 
     const result = await db.query(sql); // Pas de tableau de paramètres ici
     res.json(result.rows);
@@ -163,4 +173,146 @@ router.get('/conges_en_attente', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+router.patch('/valider/:id', async (req, res) => {
+  const congeId = req.params.id;
+  const { approbateur_id, commentaire } = req.body; // L'ID du manager ou RH qui valide
+
+  try {
+    await db.query('BEGIN');
+
+    // 1. Récupérer les infos du congé avant modification
+    const congeInfo = await db.query(
+      `SELECT employe_id, type_conge_id, nb_jours, date_debut 
+       FROM conge WHERE id = $1 FOR UPDATE`,
+      [congeId]
+    );
+
+    if (congeInfo.rows.length === 0) throw new Error("Congé introuvable");
+
+    const { employe_id, type_conge_id, nb_jours, date_debut } = congeInfo.rows[0];
+    const annee = new Date(date_debut).getFullYear();
+
+    // 2. Mettre à jour le statut du congé
+    // Note: Passe à 'approuve' (ou 'en_attente_rh' si vous avez 2 niveaux)
+    await db.query(
+      "UPDATE conge SET statut = 'approuve', updated_at = NOW() WHERE id = $1",
+      [congeId]
+    );
+
+    // 3. Mettre à jour le solde (Déduire de 'en_attente' et ajouter à 'pris')
+    // On vérifie d'abord si le type est déductible
+    const typeCheck = await db.query('SELECT deductible_solde FROM type_conge WHERE id = $1', [type_conge_id]);
+
+    if (typeCheck.rows[0].deductible_solde) {
+      const updateSolde = await db.query(`
+UPDATE solde_conge 
+    SET
+      solde_initial = solde_restant,
+      solde_restant = solde_restant - $1,
+      updated_at = NOW()
+    WHERE employe_id = $2 AND type_conge_id = $3 AND annee = $4      `,
+        [nb_jours, employe_id, type_conge_id, annee]);
+
+      if (updateSolde.rowCount === 0) throw new Error("Erreur lors de la mise à jour du solde");
+    }
+
+    // 4. Enregistrer l'étape dans le workflow
+    await db.query(`
+      INSERT INTO workflow_conge_etape (conge_id, approbateur_id, niveau, action, commentaire)
+      VALUES ($1, $2, 1, 'approuve', $3)
+    `, [congeId, approbateur_id, commentaire || 'Approuvé par le manager']);
+
+    await db.query('COMMIT');
+    res.json({ success: true, message: "Congé validé avec succès" });
+
+  } catch (error) {
+    await db.query('ROLLBACK');
+    console.error('Erreur validation congé:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/*
+router.patch('/refuser/:id', async (req, res) => {
+  const congeId = req.params.id;
+  const { approbateur_id, commentaire_refus } = req.body;
+
+  try {
+    await db.query('BEGIN');
+
+    const congeInfo = await db.query(
+      `SELECT employe_id, type_conge_id, nb_jours, date_debut FROM conge WHERE id = $1`, [congeId]
+    );
+    const { employe_id, type_conge_id, nb_jours, date_debut } = congeInfo.rows[0];
+    const annee = new Date(date_debut).getFullYear();
+
+    // 1. Statut en 'refuse' et stockage du motif de refus
+    await db.query(
+      "UPDATE conge SET statut = 'refuse', commentaire_refus = $2, updated_at = NOW() WHERE id = $1",
+      [congeId, commentaire_refus]
+    );
+
+    // 2. Libérer le solde bloqué en attente
+    await db.query(`
+      UPDATE solde_conge 
+      SET solde_en_attente = solde_en_attente - $1, updated_at = NOW()
+      WHERE employe_id = $2 AND type_conge_id = $3 AND annee = $4
+    `, [nb_jours, employe_id, type_conge_id, annee]);
+
+    // 3. Workflow
+    await db.query(`
+      INSERT INTO workflow_conge_etape (conge_id, approbateur_id, niveau, action, commentaire)
+      VALUES ($1, $2, 1, 'refuse', $3)
+    `, [congeId, approbateur_id, commentaire_refus]);
+
+    await db.query('COMMIT');
+    res.json({ success: true, message: "Congé refusé" });
+  } catch (error) {
+    await db.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  }
+});
+*/
+
+router.get('/employe_solde', async (req, res) => {
+  try {
+    const sql =
+      `
+      SELECT
+      e.id              AS employe_id,
+      e.matricule,
+      e.nom,
+      e.prenom,
+      e.email_pro,
+      e.statut          AS statut_employe,
+      e.photo_url,
+      json_agg(
+        json_build_object(
+          'type_conge_id',    tc.id,
+          'libelle',          tc.libelle,
+          'solde_initial',    sc.solde_initial,
+          'solde_acquis',     sc.solde_acquis,
+          'solde_pris',       sc.solde_pris,
+          'solde_en_attente', sc.solde_en_attente,
+          'solde_restant',    sc.solde_restant
+        ) ORDER BY tc.libelle
+      ) AS soldes
+    FROM employe e
+    LEFT JOIN solde_conge sc
+           ON sc.employe_id = e.id
+    LEFT JOIN type_conge tc
+           ON tc.id = sc.type_conge_id
+    WHERE e.statut = 'actif'
+    GROUP BY e.id, e.matricule, e.nom, e.prenom, e.email_pro, e.statut
+    ORDER BY e.nom, e.prenom
+    `;
+    const result = await db.query(sql);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Erreur type_conge:', error); // ← log complet
+    res.status(500).json({ error: error.message });
+  }
+});
+
 module.exports = router;
