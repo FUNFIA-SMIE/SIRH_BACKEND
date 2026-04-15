@@ -31,7 +31,7 @@ router.post('/', async (req, res) => {
       ) VALUES ($1, $2, $3, $4, $5, 'en_attente_manager', $6, $7, $8, $9)
       RETURNING id;
     `, [employe_id, type_conge_id, date_debut, date_fin,
-        nb_jours, motif, demi_journee_debut, demi_journee_fin, justificatif]);
+      nb_jours, motif, demi_journee_debut, demi_journee_fin, justificatif]);
 
     const newCongeId = congeResult.rows[0].id;
 
@@ -124,6 +124,42 @@ router.get('/type_conge', async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     console.error('Erreur type_conge:', error); // ← log complet
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/conges_en_attente', async (req, res) => {
+  try {
+    // Note : On retire les paramètres inutilisés dans le SQL pour éviter l'erreur 
+    // "bind message has X parameters, but prepared statement requires 0"
+    
+    const sql = `
+      SELECT 
+        c.id,
+        e.nom, 
+        e.prenom, 
+        c.date_debut, 
+        c.date_fin, 
+        c.nb_jours, 
+        c.statut,
+        tc.libelle as type_conge, -- Ajout pour plus de clarté
+        c.created_at
+      FROM 
+        conge c
+      JOIN 
+        employe e ON c.employe_id = e.id
+      LEFT JOIN 
+        type_conge tc ON c.type_conge_id = tc.id
+      WHERE 
+        c.statut NOT IN ('approuve', 'refuse', 'annule')
+      ORDER BY 
+        c.created_at DESC;
+    `;
+
+    const result = await db.query(sql); // Pas de tableau de paramètres ici
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error); // Toujours utile pour le debug côté serveur
     res.status(500).json({ error: error.message });
   }
 });
